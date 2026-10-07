@@ -7,6 +7,7 @@
 // real site, so every button/menu/dialog works exactly as on photopea.com.
 const { app, BrowserWindow, shell, session } = require('electron');
 const os = require('os'), path = require('path');
+const { version } = require('./package.json');
 
 const heapMB = parseInt(process.env.PHOTOPEA_MAX_RAM_MB || '', 10) ||
                Math.max(4096, Math.round(os.totalmem() / 1048576 * 0.8));
@@ -29,9 +30,29 @@ const AD_HOSTS = [
 // give the workspace flex-grow so it actually reclaims the freed width. Verified this keeps
 // the right-side tool panels (Layers/Channels/History) intact — an earlier attempt that
 // forced the workspace to width:100% instead broke them.
-const AD_CSS = `
-  .flexrow.app > div:first-child { flex-grow: 1 !important; }
-  .flexrow.app > div:nth-child(2) { display: none !important; }
+//
+// Applied as JS (not just insertCSS) via a MutationObserver + interval, not a one-shot
+// dom-ready hook: Photopea is a heavy SPA that builds this markup well after dom-ready, and
+// a single injection can lose a race against that. Re-applying on every DOM mutation (and as
+// a fallback, once a second for the first 20s) makes this resilient to timing instead of
+// depending on catching one exact moment.
+const FIX_JS = `
+(function() {
+  function apply() {
+    var app = document.querySelector('.flexrow.app');
+    if (!app || app.children.length < 2) { console.log('[adfix] no .flexrow.app with 2+ children yet'); return; }
+    var main = app.children[0], adRail = app.children[1];
+    main.style.setProperty('flex-grow', '1', 'important');
+    adRail.style.setProperty('display', 'none', 'important');
+    console.log('[adfix] applied, adRail now display=' + getComputedStyle(adRail).display);
+  }
+  apply();
+  try {
+    new MutationObserver(apply).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) { console.log('[adfix] observer error', e); }
+  var tries = 0;
+  var iv = setInterval(function() { apply(); if (++tries > 20) clearInterval(iv); }, 1000);
+})();
 `;
 
 let win = null;
@@ -53,8 +74,12 @@ if (!app.requestSingleInstanceLock()) {
       width: 1440, height: 900,
       icon: path.join(__dirname, 'icon.png'),
       autoHideMenuBar: true,
+      title: 'Photopea Live v' + version,
     });
     win.removeMenu();
+    // Photopea sets document.title itself (e.g. "Photopea | Online Photo Editor"), which
+    // would otherwise overwrite our version-tagged title on every load.
+    win.on('page-title-updated', (e) => e.preventDefault());
     // Jampea "Input" menu: grant Web MIDI, and auto-pick the first device for Web Bluetooth
     // (Electron has no built-in chooser UI for navigator.bluetooth.requestDevice).
     win.webContents.session.setPermissionRequestHandler((wc, permission, cb) => cb(true));
@@ -67,7 +92,12 @@ if (!app.requestSingleInstanceLock()) {
       if (/^https?:/.test(url)) shell.openExternal(url);
       return { action: 'deny' };
     });
-    win.webContents.on('dom-ready', () => { win.webContents.insertCSS(AD_CSS).catch(() => {}); });
+    const runFix = () => win.webContents.executeJavaScript(FIX_JS).catch((e) => console.log('[adfix] inject failed', e));
+    win.webContents.on('dom-ready', runFix);
+    win.webContents.on('did-finish-load', runFix);
+    if (process.env.PHOTOPEA_DEBUG === '1') {
+      win.webContents.on('console-message', (e, level, message) => console.log('[page]', message));
+    }
     // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
     // fragment makes photopea.com's own bootstrap script skip straight to the editor.
     win.loadURL('https://www.photopea.com/#');
