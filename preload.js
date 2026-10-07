@@ -17,6 +17,19 @@
 // style object — so a fix that only runs once (or stops retrying) can get silently clobbered
 // by a later resize.
 (function() {
+  // Report our own innerWidth back to the main process so it can verify the zoom factor it
+  // set actually produced the target width — needed because setZoomFactor(w/(w+pad)) doesn't
+  // reliably land on exactly w+pad (observed ~5% off in testing, cause unconfirmed — possibly
+  // OS display scaling interacting with Chromium's zoom-level quantization). Reporting
+  // repeatedly for the first few seconds gives main.js's corrective loop in main.js several
+  // chances to converge after each zoom adjustment, since changing zoom doesn't necessarily
+  // fire a 'resize' DOM event we could otherwise hook for a single remeasurement.
+  function reportWidth() { console.log('[adfix][widthreport] ' + window.innerWidth); }
+  reportWidth();
+  var reportTries = 0;
+  var reportIv = setInterval(function() { reportWidth(); if (++reportTries > 20) clearInterval(reportIv); }, 150);
+  window.addEventListener('resize', reportWidth);
+
   function install() {
     if (window.__adfixInstalled) return;
     window.__adfixInstalled = true;

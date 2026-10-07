@@ -77,9 +77,6 @@ if (!app.requestSingleInstanceLock()) {
       if (/^https?:/.test(url)) shell.openExternal(url);
       return { action: 'deny' };
     });
-    win.webContents.on('console-message', (e, level, message) => {
-      if (/\[adfix\]/.test(message)) logLine('[page] ' + message);
-    });
     // Photopea's own resize math subtracts a hardcoded width for the ad rail from
     // window.innerWidth no matter whether anything is actually shown there — confirmed by
     // direct testing (dispatching 'resize' after hiding the ad rail at several widths never
@@ -93,12 +90,41 @@ if (!app.requestSingleInstanceLock()) {
     // fits, so window.innerWidth grows accordingly, and (unlike a CSS `zoom`/`transform` style
     // on the page's own content) mouse clicks stay correctly aligned with what's drawn, since
     // the browser itself — not a page style — is doing the scaling and remapping input to match.
+    //
+    // setZoomFactor(contentWidth / target) doesn't reliably land on exactly `target` — observed
+    // the resulting innerWidth off by ~5% in testing on at least one machine, cause unconfirmed
+    // (a guess: OS display scaling interacting with Chromium's zoom-level quantization). Rather
+    // than chase the exact correction formula for every environment, close the loop: preload.js
+    // reports window.innerWidth back via console.log (repeatedly, since changing zoom doesn't
+    // necessarily fire 'resize'), and each report here refines the zoom from the *observed*
+    // width/zoom relationship instead of an assumed one, converging in a round or two regardless
+    // of what's causing the discrepancy.
     const AD_GUTTER_PX = 320;
+    let targetInnerWidth = null;
+    let correctionRound = 0;
     const applyVirtualWidthNow = () => {
       const [w] = win.getContentSize();
-      win.webContents.setZoomFactor(w / (w + AD_GUTTER_PX));
-      logLine('[adfix] applyVirtualWidth: contentWidth=' + w + ' zoom=' + (w / (w + AD_GUTTER_PX)).toFixed(4));
+      targetInnerWidth = w + AD_GUTTER_PX;
+      correctionRound = 0;
+      const zoom = w / targetInnerWidth;
+      win.webContents.setZoomFactor(zoom);
+      logLine('[adfix] round0 contentWidth=' + w + ' target=' + targetInnerWidth + ' zoom=' + zoom.toFixed(4));
     };
+    win.webContents.on('console-message', (e, level, message) => {
+      if (/\[adfix\]/.test(message)) logLine('[page] ' + message);
+      const m = message.match(/\[adfix\]\[widthreport\] (\d+)/);
+      if (!m || targetInnerWidth == null || correctionRound >= 6) return;
+      const actual = parseInt(m[1], 10);
+      if (Math.abs(targetInnerWidth - actual) <= 4) { targetInnerWidth = null; return; } // converged
+      correctionRound++;
+      const currentZoom = win.webContents.getZoomFactor();
+      // innerWidth = k / zoom for some machine-specific constant k — solve k from this actual
+      // observation, then compute the zoom that should hit the target exactly.
+      const k = actual * currentZoom;
+      const newZoom = k / targetInnerWidth;
+      win.webContents.setZoomFactor(newZoom);
+      logLine('[adfix] round' + correctionRound + ' actual=' + actual + ' target=' + targetInnerWidth + ' newZoom=' + newZoom.toFixed(4));
+    });
     // 'resize' can fire mid-animation on Windows (e.g. during the maximize transition), where
     // getContentSize() still reports a transitional, not-yet-final size — confirmed via the
     // debug log (computed zoom was based on a width ~300px short of the real maximized width).
