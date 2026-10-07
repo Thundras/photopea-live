@@ -94,12 +94,24 @@ if (!app.requestSingleInstanceLock()) {
     // on the page's own content) mouse clicks stay correctly aligned with what's drawn, since
     // the browser itself — not a page style — is doing the scaling and remapping input to match.
     const AD_GUTTER_PX = 320;
-    const applyVirtualWidth = () => {
+    const applyVirtualWidthNow = () => {
       const [w] = win.getContentSize();
       win.webContents.setZoomFactor(w / (w + AD_GUTTER_PX));
+      logLine('[adfix] applyVirtualWidth: contentWidth=' + w + ' zoom=' + (w / (w + AD_GUTTER_PX)).toFixed(4));
+    };
+    // 'resize' can fire mid-animation on Windows (e.g. during the maximize transition), where
+    // getContentSize() still reports a transitional, not-yet-final size — confirmed via the
+    // debug log (computed zoom was based on a width ~300px short of the real maximized width).
+    // Debounce and re-read the size after things settle instead of trusting the first event.
+    let settleTimer = null;
+    const applyVirtualWidth = () => {
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(applyVirtualWidthNow, 120);
     };
     win.webContents.on('did-finish-load', applyVirtualWidth);
     win.on('resize', applyVirtualWidth);
+    win.on('maximize', applyVirtualWidth);
+    win.on('unmaximize', applyVirtualWidth);
     logLine('log file: ' + LOG_PATH);
     // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
     // fragment makes photopea.com's own bootstrap script skip straight to the editor.
