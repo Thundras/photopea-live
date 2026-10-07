@@ -80,6 +80,26 @@ if (!app.requestSingleInstanceLock()) {
     win.webContents.on('console-message', (e, level, message) => {
       if (/\[adfix\]/.test(message)) logLine('[page] ' + message);
     });
+    // Photopea's own resize math subtracts a hardcoded width for the ad rail from
+    // window.innerWidth no matter whether anything is actually shown there — confirmed by
+    // direct testing (dispatching 'resize' after hiding the ad rail at several widths never
+    // reclaimed the space, because Photopea isn't measuring the ad element, just subtracting a
+    // constant baked into their own minified bundle). Rather than resize our actual OS window
+    // (which can't track live dragging/maximize without fighting the user), tell Photopea via
+    // page zoom that it has AD_GUTTER_PX more width than the window really is — Photopea's
+    // hardcoded subtraction then roughly cancels out, handing the workspace the actual full
+    // window width. webContents.setZoomFactor() is Electron/Chromium's real page zoom (same
+    // mechanism as Ctrl+scroll): zooming out genuinely increases how much CSS-pixel content
+    // fits, so window.innerWidth grows accordingly, and (unlike a CSS `zoom`/`transform` style
+    // on the page's own content) mouse clicks stay correctly aligned with what's drawn, since
+    // the browser itself — not a page style — is doing the scaling and remapping input to match.
+    const AD_GUTTER_PX = 320;
+    const applyVirtualWidth = () => {
+      const [w] = win.getContentSize();
+      win.webContents.setZoomFactor(w / (w + AD_GUTTER_PX));
+    };
+    win.webContents.on('did-finish-load', applyVirtualWidth);
+    win.on('resize', applyVirtualWidth);
     logLine('log file: ' + LOG_PATH);
     // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
     // fragment makes photopea.com's own bootstrap script skip straight to the editor.
