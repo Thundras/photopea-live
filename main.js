@@ -24,6 +24,9 @@ const AD_HOSTS = [
 const AD_CSS = `
   iframe[id^="google_ads_iframe"], ins.adsbygoogle, div[id^="div-gpt-ad"],
   [id*="google_ads"], [class*="GoogleActiveViewElement"] { display: none !important; }
+  /* Photopea's ad-rail container: identified by its "ad blocking detected" fallback
+     link, present whether a real ad loaded or not — hiding it covers both cases. */
+  div:has(> a[href*="photopea-says-i-am-blocking-ads-but-i-am-not"]) { display: none !important; }
 `;
 
 let win = null;
@@ -60,7 +63,9 @@ if (!app.requestSingleInstanceLock()) {
       return { action: 'deny' };
     });
     win.webContents.on('dom-ready', () => { win.webContents.insertCSS(AD_CSS).catch(() => {}); });
-    win.loadURL('https://www.photopea.com/');
+    // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
+    // fragment makes photopea.com's own bootstrap script skip straight to the editor.
+    win.loadURL('https://www.photopea.com/#');
     win.on('closed', () => { win = null; });
   });
   app.on('window-all-closed', () => app.quit());
