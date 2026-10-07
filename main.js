@@ -31,27 +31,38 @@ const AD_HOSTS = [
 // the right-side tool panels (Layers/Channels/History) intact — an earlier attempt that
 // forced the workspace to width:100% instead broke them.
 //
-// Applied as JS (not just insertCSS) via a MutationObserver + interval, not a one-shot
-// dom-ready hook: Photopea is a heavy SPA that builds this markup well after dom-ready, and
-// a single injection can lose a race against that. Re-applying on every DOM mutation (and as
-// a fallback, once a second for the first 20s) makes this resilient to timing instead of
-// depending on catching one exact moment.
+// Applied as JS (not just insertCSS) and kept re-applying indefinitely via a 'resize'
+// listener, a MutationObserver (childList + style/class attributes), and a 1s interval as a
+// last-resort fallback. A single dom-ready injection isn't enough: Photopea builds this
+// markup well after dom-ready, and its own resize handler reassigns the ad rail's inline
+// style on every resize/maximize — a plain JS style assignment replaces our !important
+// declaration outright since it's the same inline style object, so a fix that only runs once
+// (or stops retrying after a fixed window) can get silently clobbered by a later resize.
 const FIX_JS = `
 (function() {
+  if (window.__adfixInstalled) return; // survive re-injection (dom-ready + did-finish-load)
+  window.__adfixInstalled = true;
   function apply() {
     var app = document.querySelector('.flexrow.app');
-    if (!app || app.children.length < 2) { console.log('[adfix] no .flexrow.app with 2+ children yet'); return; }
+    if (!app || app.children.length < 2) return;
     var main = app.children[0], adRail = app.children[1];
     main.style.setProperty('flex-grow', '1', 'important');
     adRail.style.setProperty('display', 'none', 'important');
-    console.log('[adfix] applied, adRail now display=' + getComputedStyle(adRail).display);
   }
   apply();
+  // Photopea's own resize handler (bound to window 'resize') recalculates the ad rail's
+  // inline style on every resize/maximize — a *plain* JS assignment there (el.style.x = ...)
+  // replaces our whole inline-style declaration for that property, !important included, since
+  // it's the same style object. A MutationObserver watching childList alone won't catch that
+  // (no nodes added/removed, just a style change), so re-run explicitly on resize too, and
+  // keep observing style/class attribute changes — and never stop retrying, since the user
+  // can resize or maximize at any point long after the page first loaded.
+  window.addEventListener('resize', apply);
   try {
-    new MutationObserver(apply).observe(document.documentElement, { childList: true, subtree: true });
+    new MutationObserver(apply).observe(document.documentElement,
+      { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
   } catch (e) { console.log('[adfix] observer error', e); }
-  var tries = 0;
-  var iv = setInterval(function() { apply(); if (++tries > 20) clearInterval(iv); }, 1000);
+  setInterval(apply, 1000);
 })();
 `;
 
