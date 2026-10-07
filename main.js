@@ -104,15 +104,21 @@ if (!app.requestSingleInstanceLock()) {
     // debug log (computed zoom was based on a width ~300px short of the real maximized width).
     // Debounce and re-read the size after things settle instead of trusting the first event.
     let settleTimer = null;
-    const applyVirtualWidth = () => {
+    const applyVirtualWidthDebounced = () => {
       clearTimeout(settleTimer);
       settleTimer = setTimeout(applyVirtualWidthNow, 120);
     };
-    win.webContents.on('did-finish-load', applyVirtualWidth);
-    win.on('resize', applyVirtualWidth);
-    win.on('maximize', applyVirtualWidth);
-    win.on('unmaximize', applyVirtualWidth);
+    win.on('resize', applyVirtualWidthDebounced);
+    win.on('maximize', applyVirtualWidthDebounced);
+    win.on('unmaximize', applyVirtualWidthDebounced);
     logLine('log file: ' + LOG_PATH);
+    // Set the zoom *before* navigating, not on did-finish-load — did-finish-load fires only
+    // after Photopea has already rendered, same lesson as the preload-based ad-rail fix (a
+    // did-finish-load hook for that was too late too, see preload.js). Zoom is a per-WebContents
+    // setting that Chromium applies to a page from its very first paint, so setting it ahead of
+    // loadURL closes this gap the same way — confirmed this was still flashing on startup
+    // (not just on maximize) once the maximize-debounce fix made that gap visible on its own.
+    applyVirtualWidthNow();
     // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
     // fragment makes photopea.com's own bootstrap script skip straight to the editor.
     win.loadURL('https://www.photopea.com/#');
