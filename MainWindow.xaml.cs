@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 
 namespace PhotopeaLive;
@@ -12,17 +13,25 @@ namespace PhotopeaLive;
 ///
 /// Why WPF/WebView2 instead of Electron: Photopea's own layout math always reserves a
 /// fixed-width "ad rail" (its own hardcoded constant, not measured from the ad element — hiding
-/// the ad alone never reclaims the space). The fix is to make Photopea believe the window has
-/// AdGutterPx more width than it really does, via WebView2's own ZoomFactor. The Electron build
-/// tried the equivalent (WebContents.setZoomFactor, the same underlying Chromium mechanism) and
-/// it was unreliable there — the resulting innerWidth repeatedly didn't match the requested
-/// factor, even with an empirical self-correcting feedback loop, for reasons never pinned down.
-/// WebView2's own ZoomFactor — Microsoft's documented property for exactly this kind of app
-/// scaling (RasterizationScale, tried first here, turned out to be the wrong tool: it's
-/// documented as being for monitor-DPI tracking, and isn't even exposed on this control) —
-/// behaved correctly from the first try and was verified three independent ways: the DOM's own
-/// reported innerWidth, a CDP screenshot, and a raw screen-region capture (CopyFromScreen) of
-/// the actual window, both at the default size and maximized.
+/// the ad alone never reclaims the space). The original plan was to make the browser's zoom lie
+/// to Photopea about the window's width (via WebView2's ZoomFactor / Electron's
+/// setZoomFactor), the same way both builds tried and failed to do reliably.
+///
+/// Root cause found via CDP (Page.getLayoutMetrics + Object.getOwnPropertyDescriptor): Photopea's
+/// own bootstrap code replaces the native `window.innerWidth`/`innerHeight` getters with plain,
+/// static, one-time-captured number properties (confirmed: the descriptor is a plain
+/// {value, writable} data property, not a getter) — presumably to get a stable reading immune to
+/// zoom/resize jitter during its own layout math. That means Photopea's ad-rail subtraction never
+/// reads the browser's real, live viewport at all, so no amount of host-level zoom trickery could
+/// ever reach it — confirmed by CDP showing the *real* viewport (document.documentElement
+/// .clientWidth, visualViewport.width) tracking zoom correctly the whole time, while
+/// window.innerWidth stayed frozen at the original unzoomed value regardless.
+///
+/// The actual fix: skip zoom/scaling entirely. Since Photopea's own innerWidth is just a plain
+/// writable property (not protected), InnerWidthOverrideScript redefines it as a live getter —
+/// always true width + AdGutterPx — before Photopea's bootstrap ever runs and claims it for
+/// itself. A resize event is then dispatched on every real size change so Photopea's own resize
+/// handler re-reads the (now always-padded) value and relayouts.
 /// </summary>
 public partial class MainWindow : Window
 {
@@ -41,20 +50,40 @@ public partial class MainWindow : Window
         "fundingchoicesmessages.google.com", "tpc.googlesyndication.com",
     };
 
-    // Photopea's shell is a two-child flexbox: .flexrow.app > [workspace, ad-rail]. Hide the
-    // ad-rail (always the 2nd child, whether showing a real ad or nothing) and give the
-    // workspace flex-grow so it claims the freed width. Runs via
-    // AddScriptToExecuteOnDocumentCreatedAsync, WebView2's equivalent of a document-start
-    // preload script — before any of Photopea's own scripts, confirmed necessary in the
-    // Electron build (a dom-ready-equivalent hook was consistently too late, causing a visible
-    // flash). Re-applied via a resize listener, a MutationObserver, and an interval fallback,
-    // since Photopea's own resize handler reassigns the ad rail's inline style on every
-    // resize/maximize — a plain JS style assignment there replaces our !important declaration
-    // outright since it's the same inline style object.
-    private const string AdRailFixScript = @"
+    // Runs via AddScriptToExecuteOnDocumentCreatedAsync — WebView2's equivalent of a
+    // document-start preload script, before any of Photopea's own scripts. Two independent fixes
+    // in one script, both needed before Photopea's bootstrap claims innerWidth for itself:
+    //
+    // 1. Redefine window.innerWidth/innerHeight as live getters that always report the *true*
+    //    current size (via document.documentElement.clientWidth/Height, which stays accurate —
+    //    only the native innerWidth/innerHeight getters get shadowed by Photopea) plus
+    //    AdGutterPx padding on width. Photopea's own ad-rail-reservation math then subtracts its
+    //    320px from an already-320px-padded number and lands on the real width.
+    // 2. Hide the ad-rail element itself (always the flexbox's 2nd child, whether an ad renders
+    //    there or not) and give the workspace flex-grow so it visually claims the freed width.
+    //    Re-applied via a resize listener, a MutationObserver, and an interval fallback, since
+    //    Photopea's own resize handler reassigns the ad rail's inline style on every
+    //    resize/maximize — a plain JS style assignment there replaces our !important declaration
+    //    outright since it's the same inline style object.
+    private static readonly string PreloadScript = @"
 (function() {
-  if (window.__adfixInstalled) return;
-  window.__adfixInstalled = true;
+  if (window.__ppLiveInstalled) return;
+  window.__ppLiveInstalled = true;
+  var GUTTER = " + AdGutterPx + @";
+
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true,
+    enumerable: true,
+    get: function() { return (document.documentElement.clientWidth || 0) + GUTTER; },
+    set: function() {} // ignore writes from Photopea's own resize handler
+  });
+  Object.defineProperty(window, 'innerHeight', {
+    configurable: true,
+    enumerable: true,
+    get: function() { return document.documentElement.clientHeight || 0; },
+    set: function() {}
+  });
+
   function apply() {
     var appEl = document.querySelector('.flexrow.app');
     if (!appEl || appEl.children.length < 2) return;
@@ -81,7 +110,7 @@ public partial class MainWindow : Window
         Title = "Photopea Live v" + (GetType().Assembly.GetName().Version?.ToString(3) ?? "dev");
         Log("started " + DateTime.Now.ToString("O"));
 
-        SizeChanged += (_, _) => UpdateVirtualSize();
+        SizeChanged += (_, _) => DispatchResize();
         Loaded += async (_, _) => await InitializeAsync();
     }
 
@@ -118,24 +147,26 @@ public partial class MainWindow : Window
             }
         };
 
-        // ad-rail fix: runs before Photopea's own scripts on every navigation
-        await core.AddScriptToExecuteOnDocumentCreatedAsync(AdRailFixScript);
+        // innerWidth override + ad-rail fix: runs before Photopea's own scripts on every
+        // navigation, so Photopea's bootstrap only ever sees the already-padded width.
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(PreloadScript);
 
-        UpdateVirtualSize();
+        core.NavigationCompleted += (_, _) => DispatchResize();
 
         // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
         // fragment makes photopea.com's own bootstrap script skip straight to the editor.
         core.Navigate("https://www.photopea.com/#");
     }
 
-    private void UpdateVirtualSize()
+    // The innerWidth getter in PreloadScript always computes live from the true DOM width, so no
+    // measurement/correction loop is needed — we just need Photopea to re-read it whenever the
+    // real size changes, by dispatching a resize event.
+    private async void DispatchResize()
     {
-        if (Browser.CoreWebView2 == null) return; // not initialized yet; InitializeAsync calls us again once it is
-        var w = Browser.ActualWidth;
-        if (w <= 0) return;
-        var zoom = w / (w + AdGutterPx);
-        Browser.ZoomFactor = zoom;
-        Log($"UpdateVirtualSize: actualWidth={w:F0} zoomFactor={zoom:F4}");
+        var core = Browser.CoreWebView2;
+        if (core == null) return;
+        try { await core.ExecuteScriptAsync("window.dispatchEvent(new Event('resize'))"); }
+        catch { /* page may not be ready yet; NavigationCompleted will fire again */ }
     }
 
     [StructLayout(LayoutKind.Sequential)]
