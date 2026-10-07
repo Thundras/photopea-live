@@ -21,12 +21,17 @@ const AD_HOSTS = [
   'adservice.google.com', 'pagead2.googlesyndication.com', 'securepubads.g.doubleclick.net',
   'fundingchoicesmessages.google.com', 'tpc.googlesyndication.com',
 ];
+// Photopea's shell is a two-child flexbox: .flexrow.app > [workspace, ad-rail]. Neither
+// child has flex-grow, so the ad-rail reserves its own width (up to 600px, flex-shrunk to
+// fit) regardless of whether an ad actually renders in it — just hiding its *contents* (by
+// matching Google's ad markup, or the "ad blocking detected" fallback link) leaves that
+// space dead. Instead hide the ad-rail itself structurally (it's always the 2nd child) and
+// give the workspace flex-grow so it actually reclaims the freed width. Verified this keeps
+// the right-side tool panels (Layers/Channels/History) intact — an earlier attempt that
+// forced the workspace to width:100% instead broke them.
 const AD_CSS = `
-  iframe[id^="google_ads_iframe"], ins.adsbygoogle, div[id^="div-gpt-ad"],
-  [id*="google_ads"], [class*="GoogleActiveViewElement"] { display: none !important; }
-  /* Photopea's ad-rail container: identified by its "ad blocking detected" fallback
-     link, present whether a real ad loaded or not — hiding it covers both cases. */
-  div:has(> a[href*="photopea-says-i-am-blocking-ads-but-i-am-not"]) { display: none !important; }
+  .flexrow.app > div:first-child { flex-grow: 1 !important; }
+  .flexrow.app > div:nth-child(2) { display: none !important; }
 `;
 
 let win = null;
@@ -45,11 +50,7 @@ if (!app.requestSingleInstanceLock()) {
       cb({ cancel: blocked });
     });
     win = new BrowserWindow({
-      // +320: Photopea always reserves a fixed-width ad rail on the right (hardcoded in its
-      // own layout math, not computed from the ad element — hiding the ad via CSS leaves a
-      // dead gap, it doesn't reclaim the space), so size the window wider to compensate and
-      // keep the actual canvas/panel area as large as requested.
-      width: 1440 + 320, height: 900,
+      width: 1440, height: 900,
       icon: path.join(__dirname, 'icon.png'),
       autoHideMenuBar: true,
     });
