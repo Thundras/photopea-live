@@ -45,7 +45,11 @@ if (!app.requestSingleInstanceLock()) {
       cb({ cancel: blocked });
     });
     win = new BrowserWindow({
-      width: 1440, height: 900,
+      // +320: Photopea always reserves a fixed-width ad rail on the right (hardcoded in its
+      // own layout math, not computed from the ad element — hiding the ad via CSS leaves a
+      // dead gap, it doesn't reclaim the space), so size the window wider to compensate and
+      // keep the actual canvas/panel area as large as requested.
+      width: 1440 + 320, height: 900,
       icon: path.join(__dirname, 'icon.png'),
       autoHideMenuBar: true,
     });
