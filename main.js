@@ -6,8 +6,16 @@
 // No offline mirroring, no patched bundle — needs internet, but is otherwise exactly the
 // real site, so every button/menu/dialog works exactly as on photopea.com.
 const { app, BrowserWindow, shell, session } = require('electron');
-const os = require('os'), path = require('path');
+const os = require('os'), path = require('path'), fs = require('fs');
 const { version } = require('./package.json');
+
+// Always-on file log for the ad-rail fix: PowerShell doesn't reliably forward a GUI exe's
+// console output, so console.log alone isn't enough to debug this on someone else's machine.
+const LOG_PATH = path.join(os.tmpdir(), 'photopea-live-debug.log');
+fs.writeFileSync(LOG_PATH, '--- Photopea Live v' + version + ' started ' + new Date().toISOString() + ' ---\n');
+function logLine(s) {
+  try { fs.appendFileSync(LOG_PATH, '[' + new Date().toISOString().slice(11, 23) + '] ' + s + '\n'); } catch (e) {}
+}
 
 const heapMB = parseInt(process.env.PHOTOPEA_MAX_RAM_MB || '', 10) ||
                Math.max(4096, Math.round(os.totalmem() / 1048576 * 0.8));
@@ -22,49 +30,11 @@ const AD_HOSTS = [
   'adservice.google.com', 'pagead2.googlesyndication.com', 'securepubads.g.doubleclick.net',
   'fundingchoicesmessages.google.com', 'tpc.googlesyndication.com',
 ];
-// Photopea's shell is a two-child flexbox: .flexrow.app > [workspace, ad-rail]. Neither
-// child has flex-grow, so the ad-rail reserves its own width (up to 600px, flex-shrunk to
-// fit) regardless of whether an ad actually renders in it — just hiding its *contents* (by
-// matching Google's ad markup, or the "ad blocking detected" fallback link) leaves that
-// space dead. Instead hide the ad-rail itself structurally (it's always the 2nd child) and
-// give the workspace flex-grow so it actually reclaims the freed width. Verified this keeps
-// the right-side tool panels (Layers/Channels/History) intact — an earlier attempt that
-// forced the workspace to width:100% instead broke them.
-//
-// Applied as JS (not just insertCSS) and kept re-applying indefinitely via a 'resize'
-// listener, a MutationObserver (childList + style/class attributes), and a 1s interval as a
-// last-resort fallback. A single dom-ready injection isn't enough: Photopea builds this
-// markup well after dom-ready, and its own resize handler reassigns the ad rail's inline
-// style on every resize/maximize — a plain JS style assignment replaces our !important
-// declaration outright since it's the same inline style object, so a fix that only runs once
-// (or stops retrying after a fixed window) can get silently clobbered by a later resize.
-const FIX_JS = `
-(function() {
-  if (window.__adfixInstalled) return; // survive re-injection (dom-ready + did-finish-load)
-  window.__adfixInstalled = true;
-  function apply() {
-    var app = document.querySelector('.flexrow.app');
-    if (!app || app.children.length < 2) return;
-    var main = app.children[0], adRail = app.children[1];
-    main.style.setProperty('flex-grow', '1', 'important');
-    adRail.style.setProperty('display', 'none', 'important');
-  }
-  apply();
-  // Photopea's own resize handler (bound to window 'resize') recalculates the ad rail's
-  // inline style on every resize/maximize — a *plain* JS assignment there (el.style.x = ...)
-  // replaces our whole inline-style declaration for that property, !important included, since
-  // it's the same style object. A MutationObserver watching childList alone won't catch that
-  // (no nodes added/removed, just a style change), so re-run explicitly on resize too, and
-  // keep observing style/class attribute changes — and never stop retrying, since the user
-  // can resize or maximize at any point long after the page first loaded.
-  window.addEventListener('resize', apply);
-  try {
-    new MutationObserver(apply).observe(document.documentElement,
-      { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
-  } catch (e) { console.log('[adfix] observer error', e); }
-  setInterval(apply, 1000);
-})();
-`;
+// The ad-rail fix itself lives in preload.js, loaded via webPreferences.preload below — that
+// runs before any of Photopea's own scripts (confirmed via logging that dom-ready/did-finish-load
+// injection is too late: the ad rail is already built and visible by then, causing a ~0.4-0.5s
+// flash before we catch up). A raw CDP debugger.attach() can do the same thing but hung
+// indefinitely in testing; a preload script is the standard, documented way to get this timing.
 
 let win = null;
 
@@ -76,7 +46,7 @@ if (!app.requestSingleInstanceLock()) {
     if (win.isMinimized()) win.restore();
     win.focus();
   });
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     session.defaultSession.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, cb) => {
       const blocked = AD_HOSTS.some(h => details.url.includes(h));
       cb({ cancel: blocked });
@@ -86,6 +56,10 @@ if (!app.requestSingleInstanceLock()) {
       icon: path.join(__dirname, 'icon.png'),
       autoHideMenuBar: true,
       title: 'Photopea Live v' + version,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        contextIsolation: false, // preload needs to share Photopea's own `window`/`document`
+      },
     });
     win.removeMenu();
     // Photopea sets document.title itself (e.g. "Photopea | Online Photo Editor"), which
@@ -103,12 +77,10 @@ if (!app.requestSingleInstanceLock()) {
       if (/^https?:/.test(url)) shell.openExternal(url);
       return { action: 'deny' };
     });
-    const runFix = () => win.webContents.executeJavaScript(FIX_JS).catch((e) => console.log('[adfix] inject failed', e));
-    win.webContents.on('dom-ready', runFix);
-    win.webContents.on('did-finish-load', runFix);
-    if (process.env.PHOTOPEA_DEBUG === '1') {
-      win.webContents.on('console-message', (e, level, message) => console.log('[page]', message));
-    }
+    win.webContents.on('console-message', (e, level, message) => {
+      if (/\[adfix\]/.test(message)) logLine('[page] ' + message);
+    });
+    logLine('log file: ' + LOG_PATH);
     // bare "/" serves the marketing landing page with a "Start Photopea" button; a URL
     // fragment makes photopea.com's own bootstrap script skip straight to the editor.
     win.loadURL('https://www.photopea.com/#');
